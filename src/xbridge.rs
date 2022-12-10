@@ -12,7 +12,9 @@ use x11::xlib::{
     XGetWindowAttributes, XGetWindowProperty, XGrabKey, XInternAtom, XKeyEvent, XMapWindow,
     XNextEvent, XOpenDisplay, XReparentEvent, XReparentWindow, XResizeRequestEvent, XRootWindow,
     XSendEvent, XSetWindowAttributes, XSync, XUngrabKey, XUnmapWindow, XWindowAttributes,
+    XResizeWindow, XCreateSimpleWindow, XBlackPixel, XWhitePixel, XDefaultScreen
 };
+
 
 use super::key_map::{Key, KeyMap};
 
@@ -34,7 +36,7 @@ pub enum XBridgeEvent {
         parent_window: WindowHandle,
     },
     ReparentNotify {
-        parent_window: WindowHandle,
+        window: WindowHandle,
     },
 }
 
@@ -50,8 +52,8 @@ impl Drop for XBridge {
             ungrab_keys(self.display, window.clone(), keys);
         }
 
-        for screen in self.window_creation_listening_screens {
-            free_listen_window_creation(self.display, screen);
+        for screen in &self.window_creation_listening_screens {
+            free_listen_window_creation(self.display, screen.clone());
         }
     }
 }
@@ -75,70 +77,71 @@ impl XBridge {
 
     pub fn wait_next_event(&self) -> XBridgeEvent {
         unsafe {
-            let event: MaybeUninit<XEvent> = MaybeUninit::uninit();
-            XNextEvent(self.display, event.as_mut_ptr());
+            let mut event: MaybeUninit<XEvent> = MaybeUninit::uninit();
+            loop {
+                XNextEvent(self.display, event.as_mut_ptr());
 
-            match event.assume_init().type_ {
-                KeyPress => {
-                    let event = mem::transmute::<*mut XEvent, *mut XKeyEvent>(event.as_mut_ptr());
-                    let state = (&*event).state;
-                    let key_code = (&*event).keycode;
-
-                    XBridgeEvent::KeyPress {
-                        key: Key {
-                            key_state: state,
-                            key_code,
-                        },
-                        parent_window: (&*event).window,
+                match event.assume_init().type_ {
+                    _ => {} // we don't need this event, just loop again
+                    x11::xlib::KeyPress => {
+                        let event = mem::transmute::<*mut XEvent, *mut XKeyEvent>(event.as_mut_ptr());
+                        let state = (&*event).state;
+                        let key_code = (&*event).keycode;
+                        return XBridgeEvent::KeyPress {
+                            key: Key {
+                                state,
+                                code: key_code,
+                            },
+                            parent_window: (&*event).window,
+                        }
                     }
-                }
-                Expose => {
-                    let event =
-                        mem::transmute::<*mut XEvent, *mut XExposeEvent>(event.as_mut_ptr());
-                    XBridgeEvent::Expose {
-                        parent_window: (&*event).window,
+                    x11::xlib::Expose => {
+                        let event =
+                            mem::transmute::<*mut XEvent, *mut XExposeEvent>(event.as_mut_ptr());
+                        return XBridgeEvent::Expose {
+                            parent_window: (&*event).window,
+                        }
                     }
-                }
-                ResizeRequest => {
-                    let event =
-                        mem::transmute::<*mut XEvent, *mut XResizeRequestEvent>(event.as_mut_ptr());
-                    XBridgeEvent::ResizeRequest {
-                        parent_window: (&*event).window
+                    x11::xlib::ResizeRequest => {
+                        let event =
+                            mem::transmute::<*mut XEvent, *mut XResizeRequestEvent>(event.as_mut_ptr());
+                        return XBridgeEvent::ResizeRequest {
+                            parent_window: (&*event).window
+                        }
                     }
-                }
-                ConfigureRequest => {
-                    let event = mem::transmute::<*mut XEvent, *mut XConfigureRequestEvent>(
-                        event.as_mut_ptr(),
-                    );
-                    XBridgeEvent::ResizeRequest {
-                        parent_window: (&*event).window
+                    x11::xlib::ConfigureRequest => {
+                        let event = mem::transmute::<*mut XEvent, *mut XConfigureRequestEvent>(
+                            event.as_mut_ptr(),
+                            );
+                        return XBridgeEvent::ConfigureRequest {
+                            parent_window: (&*event).window
+                        }
                     }
-                }
-                ReparentNotify => {
-                    let event =
-                        mem::transmute::<*mut XEvent, *mut XReparentEvent>(event.as_mut_ptr());
-                    XBridgeEvent::ResizeRequest {
-                        parent_window: (&*event).window
+                    x11::xlib::ReparentNotify => {
+                        let event =
+                            mem::transmute::<*mut XEvent, *mut XReparentEvent>(event.as_mut_ptr());
+                        return XBridgeEvent::ReparentNotify {
+                            window: (&*event).window
+                        }
                     }
                 }
             }
         }
     }
 
-    pub fn get_window_bounds(&self, window: WindowHandle) -> (i32, i32) {
+    pub fn resize_to_parent(&self, child: WindowHandle, parent: WindowHandle) {
         unsafe {
-            let attributes: MaybeUninit<XWindowAttributes> = mem::zeroed();
-            XGetWindowAttributes(self.display, window, attributes.as_mut_ptr());
+            let mut attributes: MaybeUninit<XWindowAttributes> = mem::zeroed();
+            XGetWindowAttributes(self.display, parent, attributes.as_mut_ptr());
             XSync(self.display, False);
+            let width = attributes.assume_init().width.try_into().unwrap();
+            let height = attributes.assume_init().height.try_into().unwrap();
 
-            (
-                attributes.assume_init().width,
-                attributes.assume_init().height,
-            )
+            XResizeWindow(self.display, child, width, height);
         }
     }
 
-    pub fn grab_keys(&mut self, window: Window, key_map: KeyMap) {
+    pub fn grab_keys(&mut self, window: WindowHandle, key_map: KeyMap) {
         if let Some(keys_map) = self.grabbed_keys.get(&window) {
             // ungrab before removing them, so if there is an error
             // they can still be ungrabbed
@@ -149,17 +152,13 @@ impl XBridge {
         // we can just get rid of it
         self.grabbed_keys.remove(&window);
 
-        // grab the keys before setting the map, so they are not
-        // removed if they are never set
-        self.grabbed_keys.insert(window, key_map);
-
         // grab all of the keys
         for key in key_map.keys() {
             unsafe {
                 XGrabKey(
                     self.display,
-                    key.key_code.try_into().unwrap(),
-                    key.key_state,
+                    key.code.try_into().unwrap(),
+                    key.state,
                     window,
                     False,
                     GrabModeAsync,
@@ -167,9 +166,29 @@ impl XBridge {
                 );
             }
         }
+
+        // grab the keys before setting the map, so they are not
+        // removed if they are never set
+        self.grabbed_keys.insert(window, key_map);
+
     }
 
-    pub fn reparent_window(&self, child: Window, parent: Window) {
+    pub fn default_screen(&self) -> i32 {
+        unsafe { XDefaultScreen(self.display) }
+    }
+
+    pub fn create_window(&self, screen: i32) -> WindowHandle {
+        unsafe {
+            // get the root window
+            let root = XRootWindow(self.display, screen);
+            let black = XBlackPixel(self.display, screen);
+            let white = XWhitePixel(self.display, screen);
+
+            XCreateSimpleWindow(self.display, root, 0, 0, 1, 1, 1, black, white)
+        }
+    }
+
+    pub fn reparent_window(&self, child: WindowHandle, parent: WindowHandle) {
         unsafe {
             XUnmapWindow(self.display, child);
             XMapWindow(self.display, parent);
@@ -197,8 +216,8 @@ impl XBridge {
             y: 1,
             x_root: 1,
             y_root: 1,
-            state: key.key_state,
-            keycode: key.key_code,
+            state: key.state,
+            keycode: key.code,
             serial: 0,
             root: 0,
             subwindow: 0,
@@ -254,8 +273,8 @@ impl XBridge {
 
     pub fn listen_for_window_creation(&mut self, screen: i32) {
         // guard against listening on already active screens
-        for active_screen in self.window_creation_listening_screens {
-            if screen == active_screen {
+        for active_screen in &self.window_creation_listening_screens {
+            if screen == *active_screen {
                 return;
             }
         }
@@ -280,7 +299,7 @@ impl XBridge {
 fn ungrab_keys(display: *mut Display, window: Window, key_map: &KeyMap) {
     for key in key_map.keys() {
         unsafe {
-            XUngrabKey(display, key.key_code.try_into().unwrap(), key.key_state, window);
+            XUngrabKey(display, key.code.try_into().unwrap(), key.state, window);
         }
     }
 }
