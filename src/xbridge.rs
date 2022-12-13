@@ -46,8 +46,8 @@ pub struct XBridge {
 
 impl Drop for XBridge {
     fn drop(&mut self) {
-        for (window, keys) in &self.grabbed_keys {
-            ungrab_keys(&self.xlib, self.display, window.clone(), keys);
+        for (&window, keys) in &self.grabbed_keys {
+            ungrab_keys(&self.xlib, self.display, window, keys);
         }
 
         for screen in &self.window_creation_listening_screens {
@@ -157,13 +157,6 @@ impl XBridge {
         // if it's there we don't need it anymore, otherwise
         // we can just get rid of it
         self.grabbed_keys.remove(&window);
-
-        /*
-        unsafe {
-            (self.xlib.XGrabKey)(
-                self.display, 46, 0, window, False, GrabModeAsync, GrabModeAsync);
-        }
-        */
 
         // grab all of the keys
         for key in key_map.keys() {

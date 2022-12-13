@@ -5,15 +5,17 @@ pub mod key_map;
 pub mod rebind;
 mod xbridge;
 
-
 use key_map::KeyMap;
 use std::process::Command;
+use std::io::BufReader;
+use std::fs::File;
 
 pub fn parse_args() -> (Command, KeyMap) {
     let args: Vec<String> = std::env::args().collect();
-    let command = Command::new(&args[1]);
-    let key_map = KeyMap::from_file();
+    let file = BufReader::new(File::open(&args[1]).unwrap());
+    let command = Command::new(&args[2]);
 
+    let key_map = KeyMap::from_stream(file).unwrap();
     (command, key_map)
 }
 

@@ -1,0 +1,30 @@
+# Alt + uiop890 to Alt + 1234567
+Alt+30 Alt+10
+Alt+31 Alt+11
+Alt+32 Alt+12
+Alt+33 Alt+13
+Alt+17 Alt+14
+Alt+18 Alt+15
+Alt+19 Alt+16
+
+# Ctrl+[ to esc
+Ctrl+34 9
+
+# Ctrl+hjkl to arrows
+# K
+Ctrl+45 111
+
+# J
+Ctrl+44 116
+
+# H
+Ctrl+43 113
+
+# L
+Ctrl+46 114
+
+# Ctrl+d to Ctrl+l (search)
+Ctrl+40 Ctrl+46
+
+# Ctrl+; to Ctrl+w (close tab)
+Ctrl+47 Ctrl+25

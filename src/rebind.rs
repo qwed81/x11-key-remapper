@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::child_process::ChildProcessState;
-use super::key_map::{KeyMap, Key};
+use super::key_map::{Key, KeyMap};
 use super::xbridge::{WindowHandle, XBridge, XBridgeEvent};
 
 struct WindowState {
@@ -35,24 +35,27 @@ pub fn rebind_until_exit(child: ChildProcessState, key_map: KeyMap) {
             }
             XBridgeEvent::KeyPress { parent, key } => {
                 state.handle_key_press(parent, key, &key_map);
-            },
-            XBridgeEvent::DestroyNotify { window: _ } => () 
+            }
+            XBridgeEvent::DestroyNotify { window: _ } => (),
         }
     }
-
 }
 
 impl WindowState {
-
     fn handle_key_press(&mut self, parent: WindowHandle, pressed_key: Key, key_map: &KeyMap) {
         let new_key = match key_map.mapped_key(pressed_key) {
             Some(new_key) => new_key,
-            None => pressed_key
+            None => pressed_key,
         };
+
+        println!(
+            "from {}:{:x} to {}:{:x}",
+            pressed_key.code, pressed_key.state, new_key.code, new_key.state
+        );
 
         let child_window = match self.parent_child_map.get(&parent) {
             Some(&child_window) => child_window,
-            None => return
+            None => return,
         };
 
         self.x.send_key_event(child_window, new_key);
@@ -78,7 +81,7 @@ impl WindowState {
 
                 self.parent_child_map.insert(parent, child);
                 self.x.reparent_window(child, parent);
-                self.x.grab_keys(child, key_map.clone());
+                self.x.grab_keys(parent, key_map.clone());
             }
         }
     }
