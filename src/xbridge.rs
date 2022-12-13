@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use x11_dl::xlib::{
     AnyKey, AnyModifier, AnyPropertyType, Atom, CWEventMask, ConfigureRequest, CurrentTime,
-    Display, Expose, ExposureMask, False, GrabModeAsync, KeyPressMask, SubstructureNotifyMask,
-    True, Window, XConfigureRequestEvent, XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent,
-    XReparentEvent, XResizeRequestEvent, XSetWindowAttributes, XWindowAttributes,
+    Display, Expose, ExposureMask, False, GrabModeAsync, KeyPressMask, RevertToPointerRoot,
+    StructureNotifyMask, SubstructureNotifyMask, True, Window, XClassHint, XClientMessageEvent,
+    XConfigureRequestEvent, XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XReparentEvent,
+    XResizeRequestEvent, XSetWindowAttributes, XWindowAttributes,
 };
 
 /*
@@ -28,12 +29,24 @@ use super::key_map::{Key, KeyMap};
 pub type WindowHandle = Window;
 
 pub enum XBridgeEvent {
-    KeyPress { key: Key, parent: WindowHandle },
-    Expose { parent: WindowHandle },
-    ResizeRequest { parent: WindowHandle },
-    ConfigureRequest { parent: WindowHandle },
-    ReparentNotify { window: WindowHandle },
-    DestroyNotify { window: WindowHandle },
+    KeyPress {
+        key: Key,
+        parent: WindowHandle,
+    },
+    Expose {
+        parent: WindowHandle,
+    },
+    ConfigureNotify {
+        width: u32,
+        height: u32,
+        parent: WindowHandle,
+    },
+    ReparentNotify {
+        window: WindowHandle,
+    },
+    DestroyRequest {
+        window: WindowHandle,
+    },
 }
 
 pub struct XBridge {
@@ -80,6 +93,12 @@ impl XBridge {
         })
     }
 
+    pub fn focus_window(&self, window: WindowHandle) {
+        unsafe {
+            (self.xlib.XSetInputFocus)(self.display, window, RevertToPointerRoot, CurrentTime);
+        }
+    }
+
     pub fn wait_next_event(&self) -> XBridgeEvent {
         unsafe {
             let mut event: MaybeUninit<XEvent> = MaybeUninit::uninit();
@@ -105,16 +124,12 @@ impl XBridge {
                             parent: (&*event).window,
                         };
                     }
-                    x11_dl::xlib::ResizeRequest => {
-                        let event = event.as_mut_ptr() as *mut XResizeRequestEvent;
-                        return XBridgeEvent::ResizeRequest {
-                            parent: (&*event).window,
-                        };
-                    }
-                    x11_dl::xlib::ConfigureRequest => {
+                    x11_dl::xlib::ConfigureNotify => {
                         let event = event.as_mut_ptr() as *mut XConfigureRequestEvent;
-                        return XBridgeEvent::ConfigureRequest {
+                        return XBridgeEvent::ConfigureNotify {
                             parent: (&*event).window,
+                            width: (&*event).width.try_into().unwrap(),
+                            height: (&*event).height.try_into().unwrap(),
                         };
                     }
                     x11_dl::xlib::ReparentNotify => {
@@ -123,16 +138,18 @@ impl XBridge {
                             window: (&*event).window,
                         };
                     }
-                    x11_dl::xlib::DestroyNotify => {
-                        let event = event.as_mut_ptr() as *mut XDestroyWindowEvent;
-                        return XBridgeEvent::DestroyNotify {
-                            window: (&*event).window,
-                        };
+                    x11_dl::xlib::ClientMessage => {
+                        let event = event.as_mut_ptr() as *mut XClientMessageEvent;
+
                     }
                     _ => {} // we don't need this event, just loop again
                 }
             }
         }
+    }
+
+    fn kill_message_child() {
+        todo!();
     }
 
     pub fn resize_to_parent(&self, child: WindowHandle, parent: WindowHandle) {
@@ -143,7 +160,13 @@ impl XBridge {
             let width = attributes.assume_init().width.try_into().unwrap();
             let height = attributes.assume_init().height.try_into().unwrap();
 
-            (self.xlib.XResizeWindow)(self.display, child, width, height);
+            self.resize_to(child, width, height);
+        }
+    }
+
+    pub fn resize_to(&self, window: WindowHandle, width: u32, height: u32) {
+        unsafe {
+            (self.xlib.XResizeWindow)(self.display, window, width, height);
         }
     }
 
@@ -192,7 +215,11 @@ impl XBridge {
             let window =
                 (self.xlib.XCreateSimpleWindow)(self.display, root, 0, 0, 1, 1, 1, black, white);
 
-            (self.xlib.XSelectInput)(self.display, window, ExposureMask | KeyPressMask);
+            (self.xlib.XSelectInput)(
+                self.display,
+                window,
+                StructureNotifyMask | ExposureMask | KeyPressMask,
+            );
             (self.xlib.XMapWindow)(self.display, window);
             window
         }
@@ -239,6 +266,21 @@ impl XBridge {
 
             (self.xlib.XSendEvent)(self.display, window, False, KeyPressMask, event_ptr);
             (self.xlib.XFlush)(self.display);
+        }
+    }
+
+    pub fn get_window_class(&mut self, window: Window) -> Option<CString> {
+        unsafe {
+            let mut class_hint: MaybeUninit<XClassHint> = MaybeUninit::uninit();
+            let status = (self.xlib.XGetClassHint)(self.display, window, class_hint.as_mut_ptr());
+
+            // if it succeeded, then, return back the string
+            if status != 0 {
+                (self.xlib.XFree)(class_hint.assume_init().res_name as *mut c_void);
+                Some(CString::from_raw(class_hint.assume_init().res_class))
+            } else {
+                None
+            }
         }
     }
 

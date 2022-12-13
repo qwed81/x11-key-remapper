@@ -6,17 +6,46 @@ pub mod rebind;
 mod xbridge;
 
 use key_map::KeyMap;
-use std::process::Command;
-use std::io::BufReader;
 use std::fs::File;
+use std::io::BufReader;
 
-pub fn parse_args() -> (Command, KeyMap) {
-    let args: Vec<String> = std::env::args().collect();
+use rebind::WindowInfo;
+
+pub fn parse_args<'a>(args: &'a Vec<String>) -> (impl Fn(&WindowInfo) -> bool + 'a, KeyMap) {
+    let mut args: Vec<String> = std::env::args().collect();
     let file = BufReader::new(File::open(&args[1]).unwrap());
-    let command = Command::new(&args[2]);
-
     let key_map = KeyMap::from_stream(file).unwrap();
-    (command, key_map)
+
+    let pid = if args.len() < 4 {
+        None
+    } else {
+        Some(args[3].parse::<u32>().unwrap())
+    };
+
+    let filter = move |win_info: &WindowInfo| {
+        // turn our Option<&String> to a Option<&str>
+        let class = args.get(2).map(|c| c.as_str());
+
+        println!("class is: {:?} {:?}", win_info.class, class);
+
+        let matches_class = matches_filter(class, win_info.class);
+        let matches_pid = matches_filter(pid, win_info.pid);
+        matches_class && matches_pid
+    };
+
+    (filter, key_map)
+}
+
+fn matches_filter<P: PartialEq>(filter: Option<P>, value: Option<P>) -> bool {
+    if let Some(filter_val) = filter {
+        match value {
+            Some(value) => value == filter_val,
+            None => false
+        }
+    }
+    else {
+        true
+    }
 }
 
 /*
@@ -50,7 +79,7 @@ pub fn run() {
                         println!("expose first: {}", parent_window);
                         let child_window = child_window.unwrap();
                         parent_child_map.insert(parent_window, child_window);
-                        
+
                         x.reparent_window(child_window, parent_window);
 
                         println!("grabbing keys");

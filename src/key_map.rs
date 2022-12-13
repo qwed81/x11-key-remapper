@@ -40,7 +40,7 @@ impl KeyMap {
             buffer.clear();
 
             amt_read = stream.read_line(&mut buffer)?;
-            println!("buffer: {}", &buffer);
+            // println!("buffer: {}", &buffer);
             line_number += 1;
             
             if buffer.is_ascii() == false {
