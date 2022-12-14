@@ -10,8 +10,14 @@ use super::xbridge::{WindowHandle, XBridge, XBridgeEvent};
 
 struct WindowState {
     x: XBridge,
-    parent_child_map: HashMap<WindowHandle, WindowHandle>,
+    parent_child_map: HashMap<WindowHandle, ContainerState>,
     parent_needed_queue: VecDeque<WindowHandle>,
+}
+
+#[derive(PartialEq, PartialOrd, Clone, Copy)]
+enum ContainerState {
+    Parented(WindowHandle),
+    Exiting(WindowHandle),
 }
 
 pub struct WindowInfo<'class> {
@@ -33,18 +39,25 @@ pub fn rebind(window_filter: impl Fn(&WindowInfo) -> bool, key_map: KeyMap) {
         let event = state.x.wait_next_event();
         match event {
             XBridgeEvent::Expose { parent } => state.handle_parent_expose(parent, &key_map),
-            XBridgeEvent::ConfigureNotify { parent, width, height } => {
+            XBridgeEvent::ConfigureNotify {
+                parent,
+                width,
+                height,
+            } => {
                 state.handle_parent_update(parent, width, height);
             }
             XBridgeEvent::ReparentNotify { window } => {
                 let pid = state.x.get_window_pid(window);
                 let class = state.x.get_window_class(window);
                 let class_str = class.as_ref().map(|c| c.to_str().unwrap());
-                let info = WindowInfo { pid, class: class_str };
+                let info = WindowInfo {
+                    pid,
+                    class: class_str,
+                };
 
                 let pass_filter = window_filter(&info);
                 println!("passed filter: {}", pass_filter);
-                
+
                 if pass_filter == false {
                     continue;
                 }
@@ -54,7 +67,25 @@ pub fn rebind(window_filter: impl Fn(&WindowInfo) -> bool, key_map: KeyMap) {
             XBridgeEvent::KeyPress { parent, key } => {
                 state.handle_key_press(parent, key, &key_map);
             }
-            XBridgeEvent::DestroyRequest { window: _ } => (),
+            XBridgeEvent::DestroyRequest { window } => {
+                println!("destory request");
+
+                let child = match state.parent_child_map.get(&window) {
+                    Some(child) => match child {
+                        ContainerState::Parented(child) => child,
+                        _ => continue,
+                    },
+                    None => continue,
+                };
+
+                state.x.notify_child_should_close(*child);
+                state
+                    .parent_child_map
+                    .insert(window, ContainerState::Exiting(*child));
+            }
+            XBridgeEvent::DestroyNotify { window } => {
+                println!("destory notify");
+            }
         }
     }
 }
@@ -74,16 +105,22 @@ impl WindowState {
         */
 
         let child_window = match self.parent_child_map.get(&parent) {
-            Some(&child_window) => child_window,
+            Some(child_window) => child_window,
             None => return,
         };
 
-        self.x.send_key_event(child_window, new_key);
+        if let ContainerState::Parented(child) = child_window {
+            self.x.send_key_event(*child, new_key);
+        }
     }
 
     fn handle_parent_update(&mut self, parent: WindowHandle, width: u32, height: u32) {
         match self.parent_child_map.get(&parent) {
-            Some(&child) => self.x.resize_to(child, width, height),
+            Some(child) => {
+                if let ContainerState::Parented(child) = child {
+                    self.x.resize_to(*child, width, height);
+                }
+            }
             None => (),
         }
     }
@@ -91,7 +128,9 @@ impl WindowState {
     fn handle_parent_expose(&mut self, parent: WindowHandle, key_map: &KeyMap) {
         match self.parent_child_map.get(&parent) {
             Some(&child) => {
-                self.x.resize_to_parent(child, parent);
+                if let ContainerState::Parented(child) = child {
+                    self.x.resize_to_parent(child, parent);
+                }
             }
             None => {
                 let child = self
@@ -99,10 +138,13 @@ impl WindowState {
                     .pop_front()
                     .expect("new window exposed without queued child");
 
-                self.parent_child_map.insert(parent, child);
+                self.parent_child_map
+                    .insert(parent, ContainerState::Parented(child));
+
                 self.x.reparent_window(child, parent);
                 self.x.grab_keys(parent, key_map.clone());
                 self.x.focus_window(child);
+                println!("child parented: {}", child);
             }
         }
     }
@@ -110,7 +152,11 @@ impl WindowState {
     fn handle_window_reparent(&mut self, window: WindowHandle, screen: i32) {
         let child_window = window;
         let in_queue = self.parent_needed_queue.iter().any(|&w| w == child_window);
-        let already_parented = self.parent_child_map.values().any(|&w| w == child_window);
+        let already_parented = self.parent_child_map.values().any(|&w| match w {
+            ContainerState::Parented(child) => child == child_window,
+            ContainerState::Exiting(child) => child == child_window,
+        });
+
         if in_queue || already_parented {
             return;
         }

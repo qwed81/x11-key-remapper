@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_long, c_char, c_void, CStr, CString};
 use std::mem::{self, MaybeUninit};
 use std::ptr;
 use std::thread;
@@ -10,7 +10,8 @@ use x11_dl::xlib::{
     Display, Expose, ExposureMask, False, GrabModeAsync, KeyPressMask, RevertToPointerRoot,
     StructureNotifyMask, SubstructureNotifyMask, True, Window, XClassHint, XClientMessageEvent,
     XConfigureRequestEvent, XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XReparentEvent,
-    XResizeRequestEvent, XSetWindowAttributes, XWindowAttributes,
+    XResizeRequestEvent, XSetWindowAttributes, XWindowAttributes, ClientMessage, ClientMessageData,
+    NoEventMask
 };
 
 /*
@@ -47,6 +48,9 @@ pub enum XBridgeEvent {
     DestroyRequest {
         window: WindowHandle,
     },
+    DestroyNotify {
+        window: WindowHandle,
+    },
 }
 
 pub struct XBridge {
@@ -54,7 +58,9 @@ pub struct XBridge {
     grabbed_keys: HashMap<Window, KeyMap>,
     window_creation_listening_screens: Vec<i32>,
     xlib: Xlib,
-    cache_atom: Option<Atom>,
+    pid_atom: Option<Atom>,
+    close_window_atom: Atom,
+    wm_protocols_atom: Atom
 }
 
 impl Drop for XBridge {
@@ -84,12 +90,27 @@ impl XBridge {
             }
         }
 
+        let pid_atom = intern_atom(&xlib, display, "_NET_WM_PID");
+        let close_window_atom = match intern_atom(&xlib, display, "WM_DELETE_WINDOW") {
+            Some(atom) => atom,
+            None => return Err(())
+        };
+
+        let wm_protocols_atom = match intern_atom(&xlib, display, "WM_PROTOCOLS") {
+            Some(atom) => atom,
+            None => return Err(())
+        };
+
+        println!("close window atom is: {}", close_window_atom);
+
         Ok(XBridge {
             display,
             xlib,
             grabbed_keys: HashMap::new(),
             window_creation_listening_screens: Vec::new(),
-            cache_atom: None,
+            pid_atom,
+            close_window_atom,
+            wm_protocols_atom
         })
     }
 
@@ -140,7 +161,18 @@ impl XBridge {
                     }
                     x11_dl::xlib::ClientMessage => {
                         let event = event.as_mut_ptr() as *mut XClientMessageEvent;
+                        let message_atom = AsMut::<[u64]>::as_mut(&mut (&mut *event).data)[0];
+                        println!("client message: {}", message_atom);
 
+                        if message_atom == self.close_window_atom {
+                            return XBridgeEvent::DestroyRequest { window: (&*event).window };
+                        }
+                    }
+                    x11_dl::xlib::DestroyNotify => {
+                        let event = event.as_mut_ptr() as *mut XDestroyWindowEvent;
+                        return XBridgeEvent::DestroyNotify {
+                            window: (&*event).window
+                        }
                     }
                     _ => {} // we don't need this event, just loop again
                 }
@@ -205,7 +237,7 @@ impl XBridge {
         unsafe { (self.xlib.XDefaultScreen)(self.display) }
     }
 
-    pub fn create_window(&self, screen: i32) -> WindowHandle {
+    pub fn create_window(&mut self, screen: i32) -> WindowHandle {
         unsafe {
             // get the root window
             let root = (self.xlib.XRootWindow)(self.display, screen);
@@ -220,8 +252,58 @@ impl XBridge {
                 window,
                 StructureNotifyMask | ExposureMask | KeyPressMask,
             );
+
             (self.xlib.XMapWindow)(self.display, window);
+
+            // setup receiving the close messages from the wm
+            println!("atom is {} ", self.close_window_atom);
+            if (self.xlib.XSetWMProtocols)(self.display, window, &mut self.close_window_atom, 1) == 0 {
+                println!("could not set protocols");
+            }
+
             window
+        }
+    }
+
+    // sends a request for the child to close, and then calls 
+    // destroy window itself
+    pub fn notify_child_should_close(&self, child: WindowHandle) {
+        /*
+        XEvent ev;
+
+        memset(&ev, 0, sizeof (ev));
+
+        ev.xclient.type = ClientMessage;
+        ev.xclient.window = window;
+        ev.xclient.message_type = XInternAtom(display, "WM_PROTOCOLS", true);
+        ev.xclient.format = 32;
+        ev.xclient.data.l[0] = XInternAtom(display, "WM_DELETE_WINDOW", false);
+        ev.xclient.data.l[1] = CurrentTime;
+        XSendEvent(display, window, False, NoEventMask, &ev);
+        */
+
+        let mut client_data = [0; 10];
+        client_data[0] = self.close_window_atom as i32;
+        client_data[1] = CurrentTime as i32;
+        
+        unsafe {
+            // turn it into the format i can pass to the struct
+            let client_data = mem::transmute::<[i32; 10], ClientMessageData>(client_data);
+
+            let mut event = XClientMessageEvent {
+                type_: ClientMessage,
+                display: self.display,
+                send_event: True,
+                serial: 0,
+                window: child,
+                message_type: self.wm_protocols_atom,
+                format: 32,
+                data: client_data
+            };
+
+
+            let event_ptr = mem::transmute::<*mut XClientMessageEvent, *mut XEvent>(&mut event);
+            (self.xlib.XSendEvent)(self.display, child, False, NoEventMask, event_ptr);
         }
     }
 
@@ -285,14 +367,7 @@ impl XBridge {
     }
 
     pub fn get_window_pid(&mut self, window: Window) -> Option<u32> {
-        if self.cache_atom.is_none() {
-            let atom_name = CString::new("_NET_WM_PID").unwrap();
-            let atom = unsafe { (self.xlib.XInternAtom)(self.display, atom_name.as_ptr(), False) };
-            self.cache_atom = Some(atom);
-        }
-
-        // we know it is there because if it was none, it just got set
-        let atom = self.cache_atom.unwrap();
+        let atom = self.pid_atom?;
 
         let mut _actual_type = 0;
         let mut _actual_format = 0;
@@ -368,3 +443,9 @@ fn ungrab_keys(xlib: &Xlib, display: *mut Display, window: Window, key_map: &Key
 }
 
 fn free_listen_window_creation(display: *mut Display, screen: i32) {}
+
+fn intern_atom(xlib: &Xlib, display: *mut Display, atom_name: &'static str) -> Option<Atom> {
+    let atom_name = CString::new(atom_name).unwrap();
+    let atom = unsafe { (xlib.XInternAtom)(display, atom_name.as_ptr(), False) };
+    if atom == 0 { None } else { Some(atom) }
+}
