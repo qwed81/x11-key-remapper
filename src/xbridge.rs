@@ -11,17 +11,9 @@ use x11_dl::xlib::{
     StructureNotifyMask, SubstructureNotifyMask, True, Window, XClassHint, XClientMessageEvent,
     XConfigureRequestEvent, XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XReparentEvent,
     XResizeRequestEvent, XSetWindowAttributes, XWindowAttributes, ClientMessage, ClientMessageData,
-    NoEventMask
+    NoEventMask, FocusChangeMask, XEnterWindowEvent, XFocusChangeEvent, NotifyInferior, RevertToNone
 };
 
-/*
-use x11_dl::xlib::Xlib::{
-    XBlackPixel, XChangeWindowAttributes, XCreateSimpleWindow, XDefaultScreen,
-    XGetWindowAttributes, XGetWindowProperty, XGrabKey, XInternAtom, XMapWindow, XNextEvent,
-    XOpenDisplay, XResizeWindow, XWhitePixel,XFlush,XSync,
-    XUngrabKey, XUnmapWindow, XWindowAttributes,XReparentWindow, XRootWindow, XSendEvent,
-};
-*/
 use x11_dl::xlib::Xlib;
 
 use super::key_map::{Key, KeyMap};
@@ -51,6 +43,9 @@ pub enum XBridgeEvent {
     DestroyNotify {
         window: WindowHandle,
     },
+    ParentFocus {
+        parent: WindowHandle
+    }
 }
 
 pub struct XBridge {
@@ -60,6 +55,7 @@ pub struct XBridge {
     xlib: Xlib,
     pid_atom: Option<Atom>,
     close_window_atom: Atom,
+    take_focus_atom: Atom,
     wm_protocols_atom: Atom
 }
 
@@ -95,13 +91,18 @@ impl XBridge {
             Some(atom) => atom,
             None => return Err(())
         };
+        println!("close atom: {}", close_window_atom);
+
+        let take_focus_atom = match intern_atom(&xlib, display, "WM_TAKE_FOCUS") {
+            Some(atom) => atom,
+            None => return Err(())
+        };
+        println!("focus atom: {}", take_focus_atom);
 
         let wm_protocols_atom = match intern_atom(&xlib, display, "WM_PROTOCOLS") {
             Some(atom) => atom,
             None => return Err(())
         };
-
-        println!("close window atom is: {}", close_window_atom);
 
         Ok(XBridge {
             display,
@@ -110,13 +111,24 @@ impl XBridge {
             window_creation_listening_screens: Vec::new(),
             pid_atom,
             close_window_atom,
+            take_focus_atom,
             wm_protocols_atom
         })
     }
 
     pub fn focus_window(&self, window: WindowHandle) {
         unsafe {
-            (self.xlib.XSetInputFocus)(self.display, window, RevertToPointerRoot, CurrentTime);
+            let mut revert_to = 0;
+            let mut focus_window = 0;
+
+            /*
+            (self.xlib.XGetInputFocus)(self.display, &mut revert_to, &mut focus_window);
+            if window == focus_window.try_into().unwrap() {
+                return;
+            }
+            */
+
+            (self.xlib.XSetInputFocus)(self.display, window, RevertToNone, CurrentTime);
         }
     }
 
@@ -162,16 +174,32 @@ impl XBridge {
                     x11_dl::xlib::ClientMessage => {
                         let event = event.as_mut_ptr() as *mut XClientMessageEvent;
                         let message_atom = AsMut::<[u64]>::as_mut(&mut (&mut *event).data)[0];
-                        println!("client message: {}", message_atom);
 
                         if message_atom == self.close_window_atom {
                             return XBridgeEvent::DestroyRequest { window: (&*event).window };
+                        }
+                        else if message_atom == self.take_focus_atom {
+                            todo!();
                         }
                     }
                     x11_dl::xlib::DestroyNotify => {
                         let event = event.as_mut_ptr() as *mut XDestroyWindowEvent;
                         return XBridgeEvent::DestroyNotify {
                             window: (&*event).window
+                        }
+                    }
+                    x11_dl::xlib::FocusIn => {
+                        let event = event.as_mut_ptr() as *mut XFocusChangeEvent;
+
+                        // grab keys will cause this event to occur, we want to
+                        // filter them out so we can properly know when we need to
+                        // refocus the child
+                        if (&*event).detail == NotifyInferior {
+                            continue;
+                        }
+
+                        return XBridgeEvent::ParentFocus {
+                            parent: (&*event).window
                         }
                     }
                     _ => {} // we don't need this event, just loop again
@@ -245,20 +273,21 @@ impl XBridge {
             let white = (self.xlib.XWhitePixel)(self.display, screen);
 
             let window =
-                (self.xlib.XCreateSimpleWindow)(self.display, root, 0, 0, 1, 1, 1, black, white);
+                (self.xlib.XCreateSimpleWindow)(self.display, root, 0, 0, 1, 1, 0, black, black);
 
             (self.xlib.XSelectInput)(
                 self.display,
                 window,
-                StructureNotifyMask | ExposureMask | KeyPressMask,
+                StructureNotifyMask | ExposureMask | FocusChangeMask,
             );
 
             (self.xlib.XMapWindow)(self.display, window);
 
-            // setup receiving the close messages from the wm
-            println!("atom is {} ", self.close_window_atom);
-            if (self.xlib.XSetWMProtocols)(self.display, window, &mut self.close_window_atom, 1) == 0 {
-                println!("could not set protocols");
+            // setup receiving the close and resize messages from the wm
+            let mut atom_list = [self.take_focus_atom, self.close_window_atom];
+            let atom_list_len = atom_list.len() as i32;
+            if (self.xlib.XSetWMProtocols)(self.display, window, atom_list.as_mut_ptr(), atom_list_len) == 0 {
+                panic!("could not set protocols");
             }
 
             window
@@ -267,20 +296,21 @@ impl XBridge {
 
     // sends a request for the child to close, and then calls 
     // destroy window itself
-    pub fn notify_child_should_close(&self, child: WindowHandle) {
-        /*
-        XEvent ev;
+    pub fn notify_child_should_close(&self, child: WindowHandle, parent: WindowHandle) {
+        unsafe {
+            let root = (self.xlib.XRootWindow)(self.display, self.default_screen());
+            (self.xlib.XUnmapWindow)(self.display, child);
+            (self.xlib.XSync)(self.display, False);
 
-        memset(&ev, 0, sizeof (ev));
+            (self.xlib.XReparentWindow)(self.display, child, root, 0, 0);
 
-        ev.xclient.type = ClientMessage;
-        ev.xclient.window = window;
-        ev.xclient.message_type = XInternAtom(display, "WM_PROTOCOLS", true);
-        ev.xclient.format = 32;
-        ev.xclient.data.l[0] = XInternAtom(display, "WM_DELETE_WINDOW", false);
-        ev.xclient.data.l[1] = CurrentTime;
-        XSendEvent(display, window, False, NoEventMask, &ev);
-        */
+            // allow time for the XServer to receive the
+            // events before syncing
+            // thread::sleep(Duration::from_millis(1));
+            (self.xlib.XSync)(self.display, False);
+
+            (self.xlib.XDestroyWindow)(self.display, parent);
+        } 
 
         let mut client_data = [0; 10];
         client_data[0] = self.close_window_atom as i32;
@@ -310,7 +340,6 @@ impl XBridge {
     pub fn reparent_window(&self, child: WindowHandle, parent: WindowHandle) {
         unsafe {
             (self.xlib.XUnmapWindow)(self.display, child);
-            (self.xlib.XMapWindow)(self.display, parent);
             (self.xlib.XSync)(self.display, False);
 
             (self.xlib.XReparentWindow)(self.display, child, parent, 0, 0);
@@ -318,7 +347,7 @@ impl XBridge {
 
             // allow time for the XServer to receive the
             // events before syncing
-            thread::sleep(Duration::from_millis(25));
+            thread::sleep(Duration::from_millis(1));
             (self.xlib.XSync)(self.display, False);
         }
     }
